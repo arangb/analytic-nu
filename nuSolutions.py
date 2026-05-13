@@ -4,18 +4,18 @@ import math
 try: from scipy.optimize import leastsq
 except: leastsq = None
 
+mT = 172.5
+mW = 80.385
+mN = 0
 
-mT = 172.5   # GeV : top quark mass
-mW = 80.385  # GeV : W boson mass
-mN = 0       # GeV : neutrino mass
-
+EPS = 1e-12 # epsilon to prevent divisions by zero
 
 def UnitCircle():
     '''Unit circle in extended representation'''
     return np.diag([1, 1, -1])
 
 
-def cofactor(A, (i, j)):
+def cofactor(A, i, j):
     '''Cofactor[i,j] of 3x3 matrix A'''
     a = A[not i:2 if i==2 else None:2 if i==1 else 1,
           not j:2 if j==2 else None:2 if j==1 else 1]
@@ -36,50 +36,61 @@ def Derivative():
     return R(2, math.pi / 2).dot(np.diag([1, 1, 0]))
 
 
-def multisqrt(y):
+def multisqrt(y, eps=EPS):
     '''Valid real solutions to y=x*x'''
-    return ([] if y < 0 else
-            [0] if y == 0 else
-            (lambda r: [-r, r])(math.sqrt(y)))
+    if y < -eps:
+        return []
+    if abs(y) <= eps:
+        return [0]
+    r_ = math.sqrt(y)
+    return [-r_, r_]
 
-
-def factor_degenerate(G, zero=0):
+def factor_degenerate(G, zero=EPS):
     '''Linear factors of degenerate quadratic polynomial'''
-    if G[0,0] == 0 == G[1,1]:
+    if abs(G[0, 0]) < zero and abs(G[1, 1]) < zero:
         return [[G[0,1], 0, G[1,2]],
                 [0, G[0,1], G[0,2] - G[1,2]]]
 
     swapXY = abs(G[0,0]) > abs(G[1,1])
     Q = G[(1,0,2),][:,(1,0,2)] if swapXY else G
+    if abs(Q[1, 1]) < zero:
+        raise ZeroDivisionError("Q[1,1] too small in factor_degenerate")
     Q /= Q[1,1]
-    q22 = cofactor(Q, (2,2))
+    q22 = cofactor(Q,2,2)
 
     if -q22 <= zero:
         lines = [[Q[0,1], Q[1,1], Q[1,2]+s]
-                 for s in multisqrt(-cofactor(Q, (0,0)))]
+                 for s in multisqrt(-cofactor(Q,0,0), eps=zero)]
     else:
-        x0, y0 = [cofactor(Q,(i,2)) / q22 for i in [0, 1]]
+        if abs(q22) < zero:
+            raise ZeroDivisionError("q22 too small in factor_degenerate")
+        x0, y0 = [cofactor(Q,i,2) / q22 for i in [0, 1]]
         lines = [[m, Q[1,1], -Q[1,1]*y0 - m*x0]
                  for m in [Q[0,1] + s
-                           for s in multisqrt(-q22)]]
+                           for s in multisqrt(-q22, eps=zero)]]
 
     return [[L[swapXY],L[not swapXY],L[2]] for L in lines]
 
 
-def intersections_ellipse_line(ellipse, line, zero=1e-12):
+def intersections_ellipse_line(ellipse, line, zero=EPS):
     '''Points of intersection between ellipse and line'''
     _,V = np.linalg.eig(np.cross(line,ellipse).T)
-    sols = sorted([(v.real / v[2].real,
+    sols = sorted([(v.real / (v[2].real if abs(v[2].real) > zero else zero),
                     np.dot(line,v.real)**2 +
                     np.dot(v.real,ellipse).dot(v.real)**2)
                    for v in V.T],
-                  key=lambda (s, k): k)[:2]
+                   key=lambda s_k: s_k[1])[:2]
+                  #key=lambda (s, k): k)[:2] <-- py2
     return [s for s, k in sols if k < zero]
 
 
-def intersections_ellipses(A, B, returnLines=False):
+def intersections_ellipses(A, B, returnLines=False, zero=EPS):
     '''Points of intersection between two ellipses'''
     LA = np.linalg
+    if abs(LA.det(A)) < zero:
+        raise np.linalg.LinAlgError("Singular matrix A")
+    if abs(LA.det(B)) < zero:
+        raise np.linalg.LinAlgError("Singular matrix B")
     if abs(LA.det(B)) > abs(LA.det(A)): A,B = B,A
     e = next(e.real for e in LA.eigvals(LA.inv(A).dot(B))
              if not e.imag)
@@ -153,9 +164,9 @@ class nuSolutionSet(object):
     @property
     def R_T(self):
         '''Rotation from F coord. to laboratory coord.'''
-        b_xyz = self.b.x(), self.b.y(), self.b.z()
-        R_z = R(2, -self.mu.phi())
-        R_y = R(1, 0.5*math.pi - self.mu.theta())
+        b_xyz = self.b.X(), self.b.Y(), self.b.Z()
+        R_z = R(2, -self.mu.Phi())
+        R_y = R(1, 0.5*math.pi - self.mu.Theta())
         R_x = next(R(0,-math.atan2(z,y))
                    for x,y,z in (R_y.dot(R_z.dot(b_xyz)),))
         return R_z.T.dot(R_y.T.dot(R_x.T))
@@ -189,7 +200,7 @@ class nuSolutionSet(object):
 class singleNeutrinoSolution(object):
     '''Most likely neutrino momentum for tt-->lepton+jets'''
     def __init__(self, b, mu,   # Lorentz Vectors
-                 (metX, metY),  # Momentum imbalance
+                 metX, metY,    # Momentum imbalance
                  sigma2,        # Mo. imbalance unc. matrix
                  mW2=mW**2, mT2=mT**2):
         self.solutionSet = nuSolutionSet(b, mu, mW2, mT2)
@@ -204,6 +215,13 @@ class singleNeutrinoSolution(object):
 
         solutions = intersections_ellipses(M, UnitCircle())
         self.solutions = sorted(solutions, key=self.calcX2)
+        
+        try:
+            self.H_perp = self.solutionSet.H_perp
+            self.N = self.solutionSet.N
+        except:
+            self.H_perp = None
+            self.N = None
 
     def calcX2(self, t):
         return np.dot(t, self.X).dot(t)
@@ -217,11 +235,23 @@ class singleNeutrinoSolution(object):
         '''Solution for neutrino momentum'''
         return self.solutionSet.H.dot(self.solutions[0])
 
+    def pretty_print(self):
+        #print('b: ', b.X(), b.Y(), b.Z(), b.Energy())
+        #print('l: ', mu.X(), mu.Y(), mu.Z(), mu.Energy())
+        #print('H_tilde: ', self.solutionSet.H_tilde)
+        #print('H_perp: ', self.solutionSet.H_perp)
+        #print('H: ', self.solutionSet.H)
+        #print('met: [', metX, ", ", metY, "]")
+        #print('sigma2:',sigma2)
+        #print('S2:', S2)
+        #print('V0:', V0)
+        #print('Lambda:', deltaNu)
+        print('nu soln:', self.nu)
 
 class doubleNeutrinoSolutions(object):
     '''Solution pairs of neutrino momenta, tt -> leptons'''
-    def __init__(self, (b, b_), (mu, mu_),  # 4-vectors
-                 (metX, metY),              # ETmiss
+    def __init__(self, b, b_, mu, mu_,  # 4-vectors
+                 metX, metY,            # ETmiss
                  mW2=mW**2, mT2=mT**2):
         self.solutionSets = [nuSolutionSet(B, M, mW2, mT2)
                              for B,M in zip((b,b_),(mu,mu_))]
@@ -229,30 +259,41 @@ class doubleNeutrinoSolutions(object):
         V0 = np.outer([metX, metY, 0], [0, 0, 1])
         self.S = V0 - UnitCircle()
 
-        N, N_ = [ss.N for ss in self.solutionSets]
-        n_ = self.S.T.dot(N_).dot(self.S)
+        try:
+            # We need an exception catcher here because when running a bunch
+            # of random events often times the soln is crap or the b to lep
+            # pairing is wrong
+            # LinAlgError("Singular matrix") is thrown one of many places
+            self.N, self.N_ = [ss.N for ss in self.solutionSets]
+            self.n_ = self.S.T.dot(self.N_).dot(self.S)
 
-        v = intersections_ellipses(N, n_)
-        v_ = [self.S.dot(sol) for sol in v]
+            v = intersections_ellipses(self.N, self.n_)
+            v_ = [self.S.dot(sol) for sol in v]
 
-        if not v and leastsq:
-            es = [ss.H_perp for ss in self.solutionSets]
-            met = np.array([metX, metY, 1])
+            if not v and leastsq:
+                es = [ss.H_perp for ss in self.solutionSets]
+                met = np.array([metX, metY, 1])
 
-            def nus(ts):
-                return tuple(e.dot([math.cos(t), math.sin(t), 1])
-                             for e, t in zip(es, ts))
+                def nus(ts):
+                    return tuple(e.dot([math.cos(t), math.sin(t), 1])
+                                 for e, t in zip(es, ts))
 
-            def residuals(params):
-                return sum(nus(params), -met)[:2]
+                def residuals(params):
+                    return sum(nus(params), -met)[:2]
 
-            ts,_ = leastsq(residuals, [0, 0],
-                           ftol=5e-5, epsfcn=0.01)
-            v, v_ = [[i] for i in nus(ts)]
+                ts,_ = leastsq(residuals, [0, 0],
+                               ftol=5e-5, epsfcn=0.01)
+                v, v_ = [[i] for i in nus(ts)]
 
-        for k, v in {'perp': v, 'perp_': v_, 'n_': n_}.items():
-            setattr(self, k, v)
-
+            for k, v in list({'perp': v, 'perp_': v_, 'n_': self.n_}.items()):
+                setattr(self, k, v)
+                
+        except np.linalg.LinAlgError as err:
+            if 'Singular matrix' in str(err):
+                self.N=None
+            else:
+                raise
+                
     @property
     def nunu_s(self):
         '''Solution pairs for neutrino momenta'''
